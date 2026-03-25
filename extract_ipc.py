@@ -21,68 +21,137 @@ class IPCDataExtractor:
         self.include_main_class = include_main_class
 
         # ── 正則表達式 ──────────────────────────────────────────────
-        # 嚴格限制開頭為 A-H (IPC 部類範圍)，避免誤判其他英文縮寫
-        self.sub_class_re = re.compile(r"^([A-H]\d{2,3}[A-Z]+)\s+(.+)")  # 次類，如 D01B
-        self.main_class_re = re.compile(r"^([A-H]\d{2,3})\s+(.+)")  # 主類，如 D01
 
-        # 通用頁碼參考：支援 A-H 所有部類 (例如 A-12, D_34, H-5)
-        self.page_ref_re = re.compile(r"[.\s]*[A-H][_\-]\d+\s*$")
+        # 【修正 1】嚴格 IPC 標籤格式：
+        #   次類  A-H + 2位數 + 1個大寫字母，如 D01B, G21H, D99Z
+        #   主類  A-H + 2位數，              如 D01, G21, G99
+        #
+        # 關鍵改動：標籤之後只允許「行尾」或「2個以上空白 + 描述」，
+        # 禁止 1 個空白後接數字、或標點後緊接文字。
+        # 這樣可防止誤抓描述中的交叉引用，如：
+        #   H01J，H05G 1/00；...  → 0 空白後接 ，  → 不匹配 ✓
+        #   H04N 9/00；...        → 1 空白後接數字 → 不匹配 ✓
+        #   G06T；類比...         → 0 空白後接 ；  → 不匹配 ✓
+        #   G02B  光學元件...     → 2 空白後接中文 → 匹配   ✓
+        #   G01B  (行尾)          → 0 字符          → 匹配   ✓
+        self.sub_class_re = re.compile(
+            r"^([A-H]\d{2}[A-Z])(?:\s*$|\s{2,}(.*))"
+        )
+        self.main_class_re = re.compile(
+            r"^([A-H]\d{2})(?:\s*$|\s{2,}(.*))"
+        )
 
-        # 頁眉頁尾與雜訊過濾 (利用正則過濾無效的換頁殘留物)
-        self.noise_re = re.compile(r"^(目次|IPC 第.*版|本部內容|次部.*|\d+)$")
+        # 目次頁識別：PyMuPDF 讀取時「目次-N」出現在頁首
+        self.toc_header_re = re.compile(r"目次-\d+")
+
+        # 【修正 2】雙重頁碼清洗策略
+        #
+        # 策略 A：適用 D 部格式「...... D-9」（字母-數字）
+        self.page_ref_letter_re = re.compile(r"[\s.]*[A-H][_\-]\d+\s*$")
+        #
+        # 策略 B：適用 G 部等格式「......... 20」（點線 + 純數字）
+        # 匹配：2 個以上連續點、可選空白、可選版本注記 [n]、數字、行尾
+        self.page_ref_dots_re = re.compile(
+            r"\.{2,}[\s.]*(?:\[[\d,\s]+\]\s*)?\d+\s*$"
+        )
+        #
+        # 策略 C：「[版本注記] 頁碼」獨行，如「[2] 120」
+        # 用於 noise_re 過濾，防止混入描述
+        self.citation_page_re = re.compile(r"^\[[\d,\s]+\]\s+\d+\s*$")
+
+        # 雜訊行過濾（用於 extract_toc_text）
+        self.noise_re = re.compile(
+            r"^("
+            r"目次-?\d*"             # 目次頁眉，如「目次-1」
+            r"|IPC 第.*版"
+            r"|本部內容"
+            r"|次部[：:].*"          # 次部分隔標題
+            r"|（參見與附註省略）"
+            r"|\d+"                  # 純數字行（獨立頁碼）
+            r")$"
+        )
+
+        # 主文特徵：遇到這些代表已進入內文，強制中斷狀態機
+        # 注意：不納入 \d+/\d+，因 TOC 描述中的交叉引用（如 G01D 5/00；）
+        # 可能折行至行首，不應被誤判為主文條目。
+        # TOC 頁範圍已由 toc_header_re 嚴格限制，此處只需防邊界極端情況。
+        self.content_break_re = re.compile(
+            r"^("
+            r"次類索引"
+            r"|附註"
+            r"|[A-H]-\d+"            # 內文頁碼如 D-2, G-1
+            r")"
+        )
 
     def clean_description(self, text: str) -> str:
         """
-        清洗描述文字：
-        1. 移除結尾頁碼參考 (支援全分類)
-        2. 移除 PDF 換行造成的中文斷字空格 (高階 CJK 處理)
-        3. 壓縮連續空白
+        清洗描述文字（依序執行）：
+        1. 移除 D 部格式尾端頁碼（...... D-9）
+        2. 移除 G 部格式尾端頁碼（......... 20 或 [2,5]........ 16）
+        3. 移除 CJK 字符之間因 PDF 折行造成的空格
+        4. 壓縮連續空白
         """
-        text = self.page_ref_re.sub("", text)
+        # 策略 A：字母-數字型頁碼
+        text = self.page_ref_letter_re.sub("", text)
+        # 策略 B：點線+數字型頁碼
+        text = self.page_ref_dots_re.sub("", text)
 
-        # 處理中文字與中文字之間的空白（斷行殘留）
-        text = re.sub(
-            r"([\u4e00-\u9fff\uff00-\uffef，；、。：！？「」『』【】〔〕]) +([\u4e00-\u9fff\uff00-\uffef，；、。：！？「」『』【】〔〕A-Z（）])",
-            r"\1\2",
-            text,
-        )
-        # 執行第二次以處理連續中斷
-        text = re.sub(
-            r"([\u4e00-\u9fff\uff00-\uffef，；、。：！？「」『』【】〔〕]) +([\u4e00-\u9fff\uff00-\uffef，；、。：！？「」『』【】〔〕A-Z（）])",
-            r"\1\2",
-            text,
-        )
+        # 移除 CJK 字符間的空格（PDF 折行殘留）
+        CJK = r"[\u4e00-\u9fff\uff00-\uffef，；、。：！？「」『』【】〔〕]"
+        CJK_R = r"[\u4e00-\u9fff\uff00-\uffef，；、。：！？「」『』【】〔〕A-Z（）]"
+        text = re.sub(rf"({CJK}) +({CJK_R})", r"\1\2", text)
+        text = re.sub(rf"({CJK}) +({CJK_R})", r"\1\2", text)
+
         # 壓縮剩餘連續空白
         text = re.sub(r"\s+", " ", text)
         return text.strip()
 
     def extract_toc_text(self, pdf_path: Path) -> str:
-        """使用 PyMuPDF 提取目次頁文字，並嚴格限制只讀取目次範圍"""
+        """
+        使用 PyMuPDF 提取目次頁文字，嚴格只讀取目次範圍。
+        以頁首是否出現「目次-N」判斷是否為目次頁，離開後立即停止。
+        """
         toc_lines = []
-        found_toc = False  # 標記是否已經進入目次區塊
+        found_toc = False
+
         try:
             doc = pymupdf.open(pdf_path)
             for page in doc[:20]:
                 text = page.get_text("text")
 
-                # 嚴格界定：只處理明確包含「目次」字眼的頁面
-                if "目次" in text:
+                if self.toc_header_re.search(text):
                     found_toc = True
                     for line in text.splitlines():
                         line = line.strip()
-                        if line and not self.noise_re.match(line):
-                            toc_lines.append(line)
+                        if not line:
+                            continue
+                        # 過濾：標準雜訊行
+                        if self.noise_re.match(line):
+                            continue
+                        # 【修正 3】過濾：「[版本] 頁碼」獨行，如「[2] 120」
+                        if self.citation_page_re.match(line):
+                            continue
+                        toc_lines.append(line)
                 else:
-                    # 如果已經讀過目次頁，但下一頁卻沒有「目次」字眼，代表已經進入主文，立即強制中斷！
                     if found_toc:
                         break
+
         except Exception as e:
             print(f"[錯誤] 無法讀取 {pdf_path.name}: {e}", file=sys.stderr)
 
         return "\n".join(toc_lines)
 
     def parse_toc(self, raw_text: str) -> list[dict]:
-        """狀態機解析：加入嚴格的中斷條件，防止狀態機暴走"""
+        """
+        狀態機解析目次文字。
+
+        修正重點：
+        - sub_class_re / main_class_re 更嚴格，避免誤抓描述中的交叉引用
+        - 標籤獨行（描述為空）：下一行作為描述的起始
+        - 標籤+描述同行（2+空格分隔）：直接作為描述
+        - 「煞車」：行尾含頁碼時立刻 flush
+        - 「防呆」：遇主文特徵強制中斷
+        """
         records = []
         current_label = None
         current_desc_parts = []
@@ -94,41 +163,56 @@ class IPCDataExtractor:
                 if desc:
                     records.append({"ipc_label": current_label, "description": desc})
 
+        def has_page_ref(line: str) -> bool:
+            """判斷此行尾端是否包含頁碼（煞車用）"""
+            return bool(
+                self.page_ref_letter_re.search(line)
+                or self.page_ref_dots_re.search(line)
+            )
+
         for line in raw_text.splitlines():
-            # 優先匹配次類
+            line = line.strip()
+            if not line:
+                continue
+
+            # ── 優先嘗試次類（格式較長），再嘗試主類 ──────────────
+            matched = False
+
             m = self.sub_class_re.match(line)
             if m:
                 flush()
                 current_label = m.group(1)
-                current_desc_parts = [m.group(2)]
-
-                # 如果這行已經自帶頁碼 (代表單行就結束了)，立刻 Flush 並關閉狀態
-                if self.page_ref_re.search(line):
+                # group(2) 有值 → 標籤與描述同行（2+空白分隔）
+                # group(2) 無值 → 標籤獨行，描述在下一行
+                desc_part = (m.group(2) or "").strip()
+                current_desc_parts = [desc_part] if desc_part else []
+                # 若此行尾端已含頁碼，描述已完整，立刻結束
+                if desc_part and has_page_ref(line):
                     flush()
                     current_label = None
-                continue
+                matched = True
 
-            # 匹配主類 (若啟用)
-            if self.include_main_class:
+            if not matched and self.include_main_class:
                 m = self.main_class_re.match(line)
                 if m:
                     flush()
                     current_label = m.group(1)
-                    current_desc_parts = [m.group(2)]
-                    continue
+                    desc_part = (m.group(2) or "").strip()
+                    current_desc_parts = [desc_part] if desc_part else []
+                    matched = True
 
-            # 延續前一標籤的描述
-            if current_label:
-                # 【防呆機制】：如果遇到主文特徵 (如 1/00, 19/21, 次類索引)，強制中斷當前收集
-                if re.match(r"^(\d+/\d+|次類索引|附註)", line):
+            # ── 延續前一標籤的描述 ──────────────────────────────────
+            if not matched and current_label:
+                # 防呆：遇主文特徵行，強制中斷
+                if self.content_break_re.match(line):
                     flush()
                     current_label = None
                     continue
 
                 current_desc_parts.append(line)
 
-                # 【煞車機制】：如果這行結尾是頁碼 (如 ..... D-2)，代表敘述結束，立刻 Flush
-                if self.page_ref_re.search(line):
+                # 煞車：此行結尾是頁碼，描述完整，立刻 flush
+                if has_page_ref(line):
                     flush()
                     current_label = None
 
@@ -184,53 +268,50 @@ def main():
         print(f"[錯誤] 找不到資料夾：{data_dir.absolute()}", file=sys.stderr)
         sys.exit(1)
 
-    # 批次讀取 data 目錄下所有 PDF（含子目錄）
     pdf_files = sorted(
         [*data_dir.rglob("*.pdf"), *data_dir.rglob("*.PDF")],
         key=lambda p: str(p).lower(),
     )
 
     if not pdf_files:
-        print(
-            f"[錯誤] {data_dir.absolute()} 內沒有可處理的 PDF 檔案。", file=sys.stderr
-        )
+        print(f"[錯誤] {data_dir.absolute()} 內沒有可處理的 PDF。", file=sys.stderr)
         sys.exit(1)
 
     print(
-        f"[資訊] 在 {data_dir.absolute()} 找到 {len(pdf_files)} 個 PDF 檔案",
-        file=sys.stderr,
+        f"[資訊] 找到 {len(pdf_files)} 個 PDF 檔案", file=sys.stderr
     )
 
     extractor = IPCDataExtractor(include_main_class=False)
     all_records = []
-
     for pdf_path in pdf_files:
         all_records.extend(extractor.process_pdf(str(pdf_path)))
 
     if not all_records:
-        print("[錯誤] 未解析到任何資料，請確認 PDF 內容或路徑。", file=sys.stderr)
+        print("[錯誤] 未解析到任何資料。", file=sys.stderr)
         sys.exit(1)
 
-    # 去重機制 (以 ipc_label 為 key)
-    seen = {r["ipc_label"]: r for r in all_records}
-    deduped = list(seen.values())
-    deduped.sort(key=lambda x: x["ipc_label"])
+    # 去重（保留第一筆，即最先出現的 PDF / 頁面）
+    seen: dict[str, dict] = {}
+    for r in all_records:
+        if r["ipc_label"] not in seen:
+            seen[r["ipc_label"]] = r
+    deduped = sorted(seen.values(), key=lambda x: x["ipc_label"])
 
-    print(f"\n[完成] 共 {len(deduped)} 筆 (去重後)", file=sys.stderr)
+    print(f"\n[完成] 共 {len(deduped)} 筆（去重後）", file=sys.stderr)
 
-    # 定義輸出路徑
     csv_out = output_dir / "ipc_subclasses.csv"
     tsv_out = output_dir / "ipc_subclasses.tsv"
 
     Exporter.write_csv(deduped, csv_out)
     print(f"[輸出] CSV → {csv_out.absolute()}", file=sys.stderr)
-
     Exporter.write_tsv_for_pg(deduped, tsv_out)
     print(f"[輸出] TSV → {tsv_out.absolute()}", file=sys.stderr)
 
     print("\n── 預覽前 5 筆 ──", file=sys.stderr)
     for r in deduped[:5]:
-        print(f"  {r['ipc_label']:<8} | {r['description'][:60]}...", file=sys.stderr)
+        desc = r["description"]
+        suffix = "..." if len(desc) > 60 else ""
+        print(f"  {r['ipc_label']:<8} | {desc[:60]}{suffix}", file=sys.stderr)
 
 
 if __name__ == "__main__":
